@@ -120,7 +120,7 @@ func generatePRD(title, body, readme string) (string, error) {
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-1.5-flash-latest")
+	model := client.GenerativeModel("gemini-2.0-flash")
 
 	// 1. Generate English PRD
 	promptEn := fmt.Sprintf(
