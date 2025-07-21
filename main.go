@@ -39,6 +39,7 @@ func main() {
 }
 
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	log.Println("Received a webhook event")
 	payload, err := github.ValidatePayload(r, []byte(githubWebhookSecret))
 	if err != nil {
 		log.Printf("Error validating payload: %v", err)
@@ -55,8 +56,12 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	switch event := event.(type) {
 	case *github.IssuesEvent:
+		log.Printf("Received issue event for action: %s", event.GetAction())
 		if event.GetAction() == "labeled" && hasLabel(event.GetIssue().Labels, LabelToTrigger) {
+			log.Printf("Issue #%d labeled with '%s', starting processing.", event.GetIssue().GetNumber(), LabelToTrigger)
 			go processIssue(event.GetIssue(), event.GetRepo())
+		} else {
+			log.Printf("Issue event for issue #%d did not meet processing criteria.", event.GetIssue().GetNumber())
 		}
 	default:
 		log.Printf("Ignoring webhook event type: %T", event)
@@ -80,6 +85,9 @@ func processIssue(issue *github.Issue, repo *github.Repository) {
 
 	repoOwner := repo.GetOwner().GetLogin()
 	repoName := repo.GetName()
+	issueNumber := issue.GetNumber()
+
+	log.Printf("Processing issue #%d in %s/%s", issueNumber, repoOwner, repoName)
 
 	// Get README content
 	readme, _, _, err := client.Repositories.GetContents(ctx, repoOwner, repoName, "README.md", nil)
@@ -92,28 +100,32 @@ func processIssue(issue *github.Issue, repo *github.Repository) {
 		log.Printf("Error decoding README content for %s/%s: %v", repoOwner, repoName, err)
 		return
 	}
+	log.Printf("Successfully fetched README for %s/%s", repoOwner, repoName)
 
 	// Generate PRD
 	prdContent, err := generatePRD(issue.GetTitle(), issue.GetBody(), readmeContent)
 	if err != nil {
-		log.Printf("Error generating PRD: %v", err)
+		log.Printf("Error generating PRD for issue #%d: %v", issueNumber, err)
 		return
 	}
+	log.Printf("Successfully generated PRD for issue #%d", issueNumber)
 
 	// Post comment to issue
 	comment := &github.IssueComment{
 		Body: &prdContent,
 	}
+	log.Printf("Attempting to create comment on issue #%d", issueNumber)
 	_, _, err = client.Issues.CreateComment(ctx, repoOwner, repoName, issue.GetNumber(), comment)
 	if err != nil {
-		log.Printf("Error creating comment: %v", err)
+		log.Printf("Error creating comment on issue #%d: %v", issueNumber, err)
 	} else {
-		log.Printf("Successfully created PRD comment on issue #%d", issue.GetNumber())
+		log.Printf("Successfully created PRD comment on issue #%d", issueNumber)
 	}
 }
 
 func generatePRD(title, body, readme string) (string, error) {
 	ctx := context.Background()
+	log.Println("Generating PRD...")
 	client, err := genai.NewClient(ctx, option.WithAPIKey(googleAPIKey))
 	if err != nil {
 		return "", err
@@ -123,6 +135,7 @@ func generatePRD(title, body, readme string) (string, error) {
 	model := client.GenerativeModel("gemini-2.0-flash")
 
 	// 1. Generate English PRD
+	log.Println("Generating English PRD...")
 	promptEn := fmt.Sprintf(
 		"As a professional Product Manager, create a Product Requirements Document (PRD) based on the following GitHub issue and repository README. The PRD should be in English.\n\n"+
 			"**GitHub Issue Title:**\n%s\n\n"+
@@ -142,8 +155,10 @@ func generatePRD(title, body, readme string) (string, error) {
 		return "", fmt.Errorf("failed to generate English PRD: %w", err)
 	}
 	englishPRD := extractText(respEn)
+	log.Println("Successfully generated English PRD.")
 
 	// 2. Detect language and generate translated PRD
+	log.Println("Detecting language...")
 	languageDetectionPrompt := fmt.Sprintf("Detect the primary language of the following text. Respond with the language name only (e.g., 'Traditional Chinese', 'Japanese').\n\nText:\n%s", body)
 	respLang, err := model.GenerateContent(ctx, genai.Text(languageDetectionPrompt))
 	if err != nil {
@@ -153,7 +168,9 @@ func generatePRD(title, body, readme string) (string, error) {
 	if err == nil {
 		detectedLanguage = extractText(respLang)
 	}
+	log.Printf("Detected language: %s", detectedLanguage)
 
+	log.Printf("Generating translated PRD in %s...", detectedLanguage)
 	promptTranslate := fmt.Sprintf(
 		"Translate the following English PRD into %s. Maintain the original formatting and structure.\n\n**English PRD:**\n%s",
 		detectedLanguage, englishPRD,
@@ -164,6 +181,7 @@ func generatePRD(title, body, readme string) (string, error) {
 		return "", fmt.Errorf("failed to generate translated PRD: %w", err)
 	}
 	translatedPRD := extractText(respTranslated)
+	log.Printf("Successfully generated translated PRD in %s.", detectedLanguage)
 
 	// Combine PRDs
 	finalComment := fmt.Sprintf(
