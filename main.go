@@ -58,19 +58,23 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	switch event := event.(type) {
 	case *github.IssuesEvent:
-		log.Printf("Received issue event for action: %s", event.GetAction())
+		if event.GetAction() != "labeled" {
+			log.Printf("Ignoring issue event action: %s", event.GetAction())
+			return
+		}
+		
 		issue := event.GetIssue()
 		repo := event.GetRepo()
-		if event.GetAction() == "labeled" {
-			if hasLabel(issue.Labels, LabelToTrigger) {
-				log.Printf("Issue #%d labeled with '%s', starting PRD generation.", issue.GetNumber(), LabelToTrigger)
-				go processIssue(issue, repo)
-			} else if hasLabel(issue.Labels, LabelToTriggerSubTask) {
-				log.Printf("Issue #%d labeled with '%s', starting sub-task generation.", issue.GetNumber(), LabelToTriggerSubTask)
-				go processSubTasks(issue, repo)
-			}
-		} else {
-			log.Printf("Issue event for issue #%d did not meet processing criteria.", issue.GetNumber())
+		addedLabel := event.GetLabel().GetName()
+		log.Printf("Issue #%d was labeled with: '%s'", issue.GetNumber(), addedLabel)
+
+		switch addedLabel {
+		case LabelToTrigger:
+			go processIssue(issue, repo)
+		case LabelToTriggerSubTask:
+			go processSubTasks(issue, repo)
+		default:
+			log.Printf("Label '%s' is not a trigger label.", addedLabel)
 		}
 	default:
 		log.Printf("Ignoring webhook event type: %T", event)
@@ -79,13 +83,20 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func hasLabel(labels []*github.Label, labelName string) bool {
-	for _, label := range labels {
-		if label.GetName() == labelName {
-			return true
+func findPRDComment(ctx context.Context, client *github.Client, repoOwner, repoName string, issueNumber int) (*github.IssueComment, error) {
+	comments, _, err := client.Issues.ListComments(ctx, repoOwner, repoName, issueNumber, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching comments for issue #%d: %w", issueNumber, err)
+	}
+
+	for i := len(comments) - 1; i >= 0; i-- {
+		comment := comments[i]
+		if strings.Contains(comment.GetBody(), PRDIdentifier) {
+			log.Printf("Found PRD comment #%d for issue #%d", comment.GetID(), issueNumber)
+			return comment, nil
 		}
 	}
-	return false
+	return nil, nil // No PRD found
 }
 
 func processIssue(issue *github.Issue, repo *github.Repository) {
@@ -96,7 +107,18 @@ func processIssue(issue *github.Issue, repo *github.Repository) {
 	repoName := repo.GetName()
 	issueNumber := issue.GetNumber()
 
-	log.Printf("Processing issue #%d in %s/%s", issueNumber, repoOwner, repoName)
+	log.Printf("Processing 'NEED_PRD' for issue #%d in %s/%s", issueNumber, repoOwner, repoName)
+
+	// Check if PRD already exists
+	existingPRD, err := findPRDComment(ctx, client, repoOwner, repoName, issueNumber)
+	if err != nil {
+		log.Printf("Error checking for existing PRD on issue #%d: %v", issueNumber, err)
+		return
+	}
+	if existingPRD != nil {
+		log.Printf("PRD already exists for issue #%d. Skipping generation.", issueNumber)
+		return
+	}
 
 	// Get README content
 	readme, _, _, err := client.Repositories.GetContents(ctx, repoOwner, repoName, "README.md", nil)
@@ -123,10 +145,10 @@ func processIssue(issue *github.Issue, repo *github.Repository) {
 	comment := &github.IssueComment{
 		Body: &prdContent,
 	}
-	log.Printf("Attempting to create comment on issue #%d", issueNumber)
+	log.Printf("Attempting to create PRD comment on issue #%d", issueNumber)
 	_, _, err = client.Issues.CreateComment(ctx, repoOwner, repoName, issue.GetNumber(), comment)
 	if err != nil {
-		log.Printf("Error creating comment on issue #%d: %v", issueNumber, err)
+		log.Printf("Error creating PRD comment on issue #%d: %v", issueNumber, err)
 	} else {
 		log.Printf("Successfully created PRD comment on issue #%d", issueNumber)
 	}
@@ -140,32 +162,22 @@ func processSubTasks(issue *github.Issue, repo *github.Repository) {
 	repoName := repo.GetName()
 	issueNumber := issue.GetNumber()
 
-	log.Printf("Processing sub-tasks for issue #%d in %s/%s", issueNumber, repoOwner, repoName)
+	log.Printf("Processing 'NEED_SUB_TASK' for issue #%d in %s/%s", issueNumber, repoOwner, repoName)
 
-	// 1. Fetch comments to find the PRD
-	comments, _, err := client.Issues.ListComments(ctx, repoOwner, repoName, issueNumber, nil)
+	// 1. Fetch PRD comment
+	prdComment, err := findPRDComment(ctx, client, repoOwner, repoName, issueNumber)
 	if err != nil {
-		log.Printf("Error fetching comments for issue #%d: %v", issueNumber, err)
+		log.Printf("Error finding PRD comment for issue #%d: %v", issueNumber, err)
 		return
 	}
-
-	var prdContent string
-	for i := len(comments) - 1; i >= 0; i-- {
-		comment := comments[i]
-		if strings.Contains(comment.GetBody(), PRDIdentifier) {
-			log.Printf("Found PRD comment #%d for issue #%d", comment.GetID(), issueNumber)
-			prdContent = comment.GetBody()
-			break
-		}
-	}
-
-	if prdContent == "" {
+	if prdComment == nil {
 		log.Printf("No PRD comment found for issue #%d. Aborting sub-task generation.", issueNumber)
+		// Optional: Post a comment back to the user telling them to generate a PRD first.
 		return
 	}
 
 	// 2. Generate Sub-tasks from PRD
-	subTasks, err := generateSubTasks(prdContent)
+	subTasks, err := generateSubTasks(prdComment.GetBody())
 	if err != nil {
 		log.Printf("Error generating sub-tasks for issue #%d: %v", issueNumber, err)
 		return
@@ -180,8 +192,18 @@ func processSubTasks(issue *github.Issue, repo *github.Repository) {
 	_, _, err = client.Issues.CreateComment(ctx, repoOwner, repoName, issueNumber, comment)
 	if err != nil {
 		log.Printf("Error creating sub-task comment on issue #%d: %v", issueNumber, err)
+		return // Don't remove label if commenting fails
+	}
+	log.Printf("Successfully created sub-task comment on issue #%d", issueNumber)
+
+	// 4. Remove the "NEED_PRD" label as it's no longer needed
+	log.Printf("Attempting to remove '%s' label from issue #%d", LabelToTrigger, issueNumber)
+	_, err = client.Issues.RemoveLabelForIssue(ctx, repoOwner, repoName, issueNumber, LabelToTrigger)
+	if err != nil {
+		// Log the error but don't fail the whole operation, as the main goal was achieved.
+		log.Printf("Failed to remove '%s' label from issue #%d: %v", LabelToTrigger, issueNumber, err)
 	} else {
-		log.Printf("Successfully created sub-task comment on issue #%d", issueNumber)
+		log.Printf("Successfully removed '%s' label from issue #%d", LabelToTrigger, issueNumber)
 	}
 }
 
