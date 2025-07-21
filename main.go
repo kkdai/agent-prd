@@ -14,7 +14,9 @@ import (
 )
 
 const (
-	LabelToTrigger = "NEED_PRD"
+	LabelToTrigger         = "NEED_PRD"
+	LabelToTriggerSubTask  = "NEED_SUB_TASK"
+	PRDIdentifier          = "### PRD (Product Requirements Document)"
 )
 
 var (
@@ -57,11 +59,18 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	switch event := event.(type) {
 	case *github.IssuesEvent:
 		log.Printf("Received issue event for action: %s", event.GetAction())
-		if event.GetAction() == "labeled" && hasLabel(event.GetIssue().Labels, LabelToTrigger) {
-			log.Printf("Issue #%d labeled with '%s', starting processing.", event.GetIssue().GetNumber(), LabelToTrigger)
-			go processIssue(event.GetIssue(), event.GetRepo())
+		issue := event.GetIssue()
+		repo := event.GetRepo()
+		if event.GetAction() == "labeled" {
+			if hasLabel(issue.Labels, LabelToTrigger) {
+				log.Printf("Issue #%d labeled with '%s', starting PRD generation.", issue.GetNumber(), LabelToTrigger)
+				go processIssue(issue, repo)
+			} else if hasLabel(issue.Labels, LabelToTriggerSubTask) {
+				log.Printf("Issue #%d labeled with '%s', starting sub-task generation.", issue.GetNumber(), LabelToTriggerSubTask)
+				go processSubTasks(issue, repo)
+			}
 		} else {
-			log.Printf("Issue event for issue #%d did not meet processing criteria.", event.GetIssue().GetNumber())
+			log.Printf("Issue event for issue #%d did not meet processing criteria.", issue.GetNumber())
 		}
 	default:
 		log.Printf("Ignoring webhook event type: %T", event)
@@ -121,6 +130,90 @@ func processIssue(issue *github.Issue, repo *github.Repository) {
 	} else {
 		log.Printf("Successfully created PRD comment on issue #%d", issueNumber)
 	}
+}
+
+func processSubTasks(issue *github.Issue, repo *github.Repository) {
+	ctx := context.Background()
+	client := github.NewClient(nil).WithAuthToken(githubToken)
+
+	repoOwner := repo.GetOwner().GetLogin()
+	repoName := repo.GetName()
+	issueNumber := issue.GetNumber()
+
+	log.Printf("Processing sub-tasks for issue #%d in %s/%s", issueNumber, repoOwner, repoName)
+
+	// 1. Fetch comments to find the PRD
+	comments, _, err := client.Issues.ListComments(ctx, repoOwner, repoName, issueNumber, nil)
+	if err != nil {
+		log.Printf("Error fetching comments for issue #%d: %v", issueNumber, err)
+		return
+	}
+
+	var prdContent string
+	for i := len(comments) - 1; i >= 0; i-- {
+		comment := comments[i]
+		if strings.Contains(comment.GetBody(), PRDIdentifier) {
+			log.Printf("Found PRD comment #%d for issue #%d", comment.GetID(), issueNumber)
+			prdContent = comment.GetBody()
+			break
+		}
+	}
+
+	if prdContent == "" {
+		log.Printf("No PRD comment found for issue #%d. Aborting sub-task generation.", issueNumber)
+		return
+	}
+
+	// 2. Generate Sub-tasks from PRD
+	subTasks, err := generateSubTasks(prdContent)
+	if err != nil {
+		log.Printf("Error generating sub-tasks for issue #%d: %v", issueNumber, err)
+		return
+	}
+	log.Printf("Successfully generated sub-tasks for issue #%d", issueNumber)
+
+	// 3. Post the sub-tasks as a new comment
+	comment := &github.IssueComment{
+		Body: &subTasks,
+	}
+	log.Printf("Attempting to create sub-task comment on issue #%d", issueNumber)
+	_, _, err = client.Issues.CreateComment(ctx, repoOwner, repoName, issueNumber, comment)
+	if err != nil {
+		log.Printf("Error creating sub-task comment on issue #%d: %v", issueNumber, err)
+	} else {
+		log.Printf("Successfully created sub-task comment on issue #%d", issueNumber)
+	}
+}
+
+func generateSubTasks(prdContent string) (string, error) {
+	ctx := context.Background()
+	log.Println("Generating sub-tasks from PRD...")
+	client, err := genai.NewClient(ctx, option.WithAPIKey(googleAPIKey))
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
+
+	model := client.GenerativeModel("gemini-2.0-flash")
+
+	prompt := fmt.Sprintf(
+		"As an expert project manager, break down the following Product Requirements Document (PRD) into a series of actionable sub-tasks for the development team. Each sub-task should be a single, distinct piece of work.\n\n"+
+			"Format the output as a GitHub-flavored Markdown checklist. Each item should clearly state the main function to be completed.\n\n"+
+			"**Example:**\n"+
+			"- [ ] Set up the initial project structure and CI/CD pipeline.\n"+
+			"- [ ] Develop the user authentication module.\n\n"+
+			"**Here is the PRD:**\n%s",
+		prdContent,
+	)
+
+	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		return "", fmt.Errorf("failed to generate sub-tasks: %w", err)
+	}
+	subTasks := extractText(resp)
+
+	finalComment := fmt.Sprintf("### Generated Sub-tasks\n\n%s", subTasks)
+	return finalComment, nil
 }
 
 func generatePRD(title, body, readme string) (string, error) {
@@ -185,7 +278,8 @@ func generatePRD(title, body, readme string) (string, error) {
 
 	// Combine PRDs
 	finalComment := fmt.Sprintf(
-		"### PRD (Product Requirements Document)\n\n---\n\n%s\n\n---\n\n### PRD (%s)\n\n%s",
+		"%s\n\n---\n\n%s\n\n---\n\n### PRD (%s)\n\n%s",
+		PRDIdentifier,
 		englishPRD,
 		strings.TrimSpace(detectedLanguage),
 		translatedPRD,
