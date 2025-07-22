@@ -6,28 +6,32 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
+	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/google/generative-ai-go/genai"
 	"github.com/google/go-github/v58/github"
 	"google.golang.org/api/option"
 )
 
 const (
-	LabelToTrigger         = "NEED_PRD"
-	LabelToTriggerSubTask  = "NEED_SUB_TASK"
+	CommandGeneratePRD     = "need_prd"
+	CommandGenerateSubTask = "need_sub_task"
 	PRDIdentifier          = "### PRD (Product Requirements Document)"
 )
 
 var (
-	githubToken         = os.Getenv("GITHUB_TOKEN")
+	githubAppID         = os.Getenv("GITHUB_APP_ID")
+	githubAppPrivateKey = os.Getenv("GITHUB_APP_PRIVATE_KEY")
+	githubAppName       = os.Getenv("GITHUB_APP_NAME")
 	googleAPIKey        = os.Getenv("GOOGLE_API_KEY")
 	githubWebhookSecret = os.Getenv("GITHUB_WEBHOOK_SECRET")
 )
 
 func main() {
-	if githubToken == "" || googleAPIKey == "" || githubWebhookSecret == "" {
-		log.Fatal("Missing required environment variables: GITHUB_TOKEN, GOOGLE_API_KEY, GITHUB_WEBHOOK_SECRET")
+	if githubAppID == "" || githubAppPrivateKey == "" || githubAppName == "" || googleAPIKey == "" || githubWebhookSecret == "" {
+		log.Fatal("Missing required environment variables: GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, GITHUB_APP_NAME, GOOGLE_API_KEY, GITHUB_WEBHOOK_SECRET")
 	}
 
 	http.HandleFunc("/webhook", handleWebhook)
@@ -38,6 +42,23 @@ func main() {
 	}
 	log.Printf("Server listening on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func createGitHubClient(installationID int64) (*github.Client, error) {
+	appID, err := strconv.ParseInt(githubAppID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid GITHUB_APP_ID: %w", err)
+	}
+
+	// Use ghinstallation library to create a transport that authenticates as the GitHub App
+	itr, err := ghinstallation.New(http.DefaultTransport, appID, installationID, []byte(githubAppPrivateKey))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create installation transport: %w", err)
+	}
+
+	// Use the installation transport with a new http.Client to create the GitHub client
+	httpClient := &http.Client{Transport: itr}
+	return github.NewClient(httpClient), nil
 }
 
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
@@ -57,25 +78,43 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch event := event.(type) {
-	case *github.IssuesEvent:
-		if event.GetAction() != "labeled" {
-			log.Printf("Ignoring issue event action: %s", event.GetAction())
+	case *github.IssueCommentEvent:
+		// We only care about newly created comments
+		if event.GetAction() != "created" {
+			log.Printf("Ignoring comment event action: %s", event.GetAction())
 			return
 		}
-		
+
+		commentBody := event.GetComment().GetBody()
+		botMention := "@" + githubAppName
+		// Check if the comment mentions the bot
+		if !strings.Contains(commentBody, botMention) {
+			log.Println("Comment does not mention the bot.")
+			return
+		}
+
 		issue := event.GetIssue()
 		repo := event.GetRepo()
-		addedLabel := event.GetLabel().GetName()
-		log.Printf("Issue #%d was labeled with: '%s'", issue.GetNumber(), addedLabel)
+		installationID := event.GetInstallation().GetID()
+		log.Printf("Bot was mentioned in a comment on issue #%d", issue.GetNumber())
 
-		switch addedLabel {
-		case LabelToTrigger:
-			go processIssue(issue, repo)
-		case LabelToTriggerSubTask:
-			go processSubTasks(issue, repo)
-		default:
-			log.Printf("Label '%s' is not a trigger label.", addedLabel)
+		// Create a client authenticated for this specific installation
+		client, err := createGitHubClient(installationID)
+		if err != nil {
+			log.Printf("Error creating GitHub client: %v", err)
+			return
 		}
+		ctx := context.Background()
+
+		// Check which command was issued
+		if strings.Contains(commentBody, CommandGeneratePRD) {
+			go processIssue(ctx, client, issue, repo)
+		} else if strings.Contains(commentBody, CommandGenerateSubTask) {
+			go processSubTasks(ctx, client, issue, repo)
+		} else {
+			log.Printf("Mention did not contain a valid command ('%s' or '%s').", CommandGeneratePRD, CommandGenerateSubTask)
+		}
+
 	default:
 		log.Printf("Ignoring webhook event type: %T", event)
 	}
@@ -99,15 +138,12 @@ func findPRDComment(ctx context.Context, client *github.Client, repoOwner, repoN
 	return nil, nil // No PRD found
 }
 
-func processIssue(issue *github.Issue, repo *github.Repository) {
-	ctx := context.Background()
-	client := github.NewClient(nil).WithAuthToken(githubToken)
-
+func processIssue(ctx context.Context, client *github.Client, issue *github.Issue, repo *github.Repository) {
 	repoOwner := repo.GetOwner().GetLogin()
 	repoName := repo.GetName()
 	issueNumber := issue.GetNumber()
 
-	log.Printf("Processing 'NEED_PRD' for issue #%d in %s/%s", issueNumber, repoOwner, repoName)
+	log.Printf("Processing '%s' for issue #%d in %s/%s", CommandGeneratePRD, issueNumber, repoOwner, repoName)
 
 	// Check if PRD already exists
 	existingPRD, err := findPRDComment(ctx, client, repoOwner, repoName, issueNumber)
@@ -117,6 +153,7 @@ func processIssue(issue *github.Issue, repo *github.Repository) {
 	}
 	if existingPRD != nil {
 		log.Printf("PRD already exists for issue #%d. Skipping generation.", issueNumber)
+		// Optionally, post a comment back saying it already exists.
 		return
 	}
 
@@ -154,15 +191,12 @@ func processIssue(issue *github.Issue, repo *github.Repository) {
 	}
 }
 
-func processSubTasks(issue *github.Issue, repo *github.Repository) {
-	ctx := context.Background()
-	client := github.NewClient(nil).WithAuthToken(githubToken)
-
+func processSubTasks(ctx context.Context, client *github.Client, issue *github.Issue, repo *github.Repository) {
 	repoOwner := repo.GetOwner().GetLogin()
 	repoName := repo.GetName()
 	issueNumber := issue.GetNumber()
 
-	log.Printf("Processing 'NEED_SUB_TASK' for issue #%d in %s/%s", issueNumber, repoOwner, repoName)
+	log.Printf("Processing '%s' for issue #%d in %s/%s", CommandGenerateSubTask, issueNumber, repoOwner, repoName)
 
 	// 1. Fetch PRD comment
 	prdComment, err := findPRDComment(ctx, client, repoOwner, repoName, issueNumber)
@@ -173,6 +207,9 @@ func processSubTasks(issue *github.Issue, repo *github.Repository) {
 	if prdComment == nil {
 		log.Printf("No PRD comment found for issue #%d. Aborting sub-task generation.", issueNumber)
 		// Optional: Post a comment back to the user telling them to generate a PRD first.
+		noPrdMessage := fmt.Sprintf("I couldn't find a PRD to generate sub-tasks from. Please run `@%s %s` first.", githubAppName, CommandGeneratePRD)
+		comment := &github.IssueComment{Body: &noPrdMessage}
+		_, _, _ = client.Issues.CreateComment(ctx, repoOwner, repoName, issueNumber, comment)
 		return
 	}
 
@@ -192,18 +229,8 @@ func processSubTasks(issue *github.Issue, repo *github.Repository) {
 	_, _, err = client.Issues.CreateComment(ctx, repoOwner, repoName, issueNumber, comment)
 	if err != nil {
 		log.Printf("Error creating sub-task comment on issue #%d: %v", issueNumber, err)
-		return // Don't remove label if commenting fails
-	}
-	log.Printf("Successfully created sub-task comment on issue #%d", issueNumber)
-
-	// 4. Remove the "NEED_PRD" label as it's no longer needed
-	log.Printf("Attempting to remove '%s' label from issue #%d", LabelToTrigger, issueNumber)
-	_, err = client.Issues.RemoveLabelForIssue(ctx, repoOwner, repoName, issueNumber, LabelToTrigger)
-	if err != nil {
-		// Log the error but don't fail the whole operation, as the main goal was achieved.
-		log.Printf("Failed to remove '%s' label from issue #%d: %v", LabelToTrigger, issueNumber, err)
 	} else {
-		log.Printf("Successfully removed '%s' label from issue #%d", LabelToTrigger, issueNumber)
+		log.Printf("Successfully created sub-task comment on issue #%d", issueNumber)
 	}
 }
 
@@ -216,7 +243,7 @@ func generateSubTasks(prdContent string) (string, error) {
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-2.0-flash")
+	model := client.GenerativeModel("gemini-2.0-flash") // Using 1.5 Flash as it's generally better and cost-effective
 
 	prompt := fmt.Sprintf(
 		"As an expert project manager, break down the following Product Requirements Document (PRD) into a series of actionable sub-tasks for the development team. Each sub-task should be a single, distinct piece of work.\n\n"+
@@ -234,7 +261,7 @@ func generateSubTasks(prdContent string) (string, error) {
 	}
 	subTasks := extractText(resp)
 
-	finalComment := fmt.Sprintf("### Generated Sub-tasks\n\n%s", subTasks)
+	finalComment := fmt.Sprintf("### Generated Sub-tasks\n\nBased on the PRD, here are the suggested sub-tasks:\n\n%s", subTasks)
 	return finalComment, nil
 }
 
@@ -247,7 +274,7 @@ func generatePRD(title, body, readme string) (string, error) {
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-2.0-flash")
+	model := client.GenerativeModel("gemini-2.0-flash") // Using 1.5 Flash
 
 	// 1. Generate English PRD
 	log.Println("Generating English PRD...")
@@ -293,7 +320,13 @@ func generatePRD(title, body, readme string) (string, error) {
 
 	respTranslated, err := model.GenerateContent(ctx, genai.Text(promptTranslate))
 	if err != nil {
-		return "", fmt.Errorf("failed to generate translated PRD: %w", err)
+		// Fallback to just returning the English PRD if translation fails
+		log.Printf("Failed to generate translated PRD, falling back to English only: %v", err)
+		return fmt.Sprintf(
+			"%s\n\n---\n\n%s",
+			PRDIdentifier,
+			englishPRD,
+		), nil
 	}
 	translatedPRD := extractText(respTranslated)
 	log.Printf("Successfully generated translated PRD in %s.", detectedLanguage)
