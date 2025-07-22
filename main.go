@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/http"
@@ -152,7 +153,14 @@ func createGitHubClient(installationID int64) (*github.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid GITHUB_APP_ID: %w", err)
 	}
-	itr, err := ghinstallation.New(http.DefaultTransport, appID, installationID, []byte(githubAppPrivateKey))
+
+	// Decode the Base64 encoded private key
+	privateKeyBytes, err := base64.StdEncoding.DecodeString(githubAppPrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode base64 private key: %w", err)
+	}
+
+	itr, err := ghinstallation.New(http.DefaultTransport, appID, installationID, privateKeyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create installation transport: %w", err)
 	}
