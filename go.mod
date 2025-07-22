@@ -3,6 +3,7 @@ module github.com/al03034132/github-prd-bot
 go 1.24.3
 
 require (
+	github.com/bradleyfalzon/ghinstallation/v2 v2.16.0
 	github.com/google/generative-ai-go v0.20.1
 	github.com/google/go-github/v58 v58.0.0
 	google.golang.org/api v0.186.0
@@ -18,8 +19,10 @@ require (
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.1 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
+	github.com/google/go-github/v72 v72.0.0 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/google/s2a-go v0.1.7 // indirect
 	github.com/google/uuid v1.6.0 // indirect
