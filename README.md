@@ -2,6 +2,9 @@
 
 這是一個基於 Go 語言開發的 GitHub 機器人。
 
+<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/09562463-f84e-4617-9b27-672863afcc29" />
+
+
 ## 功能
 
 這個機器人會根據您在 GitHub Issue 上使用的標籤 (Label) 來觸發不同的自動化功能。
