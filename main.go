@@ -198,7 +198,6 @@ func processIssue(ctx context.Context, client *github.Client, issue *github.Issu
 	_, _, err = client.Issues.CreateComment(ctx, repoOwner, repoName, issue.GetNumber(), comment)
 	if err != nil {
 		log.Printf("Error creating PRD comment on issue #%d: %v", issueNumber, err)
-	}
 	} else {
 		log.Printf("Successfully created PRD comment on issue #%d", issueNumber)
 	}
@@ -238,7 +237,6 @@ func processSubTasks(ctx context.Context, client *github.Client, issue *github.I
 	_, _, err = client.Issues.CreateComment(ctx, repoOwner, repoName, issueNumber, comment)
 	if err != nil {
 		log.Printf("Error creating sub-task comment on issue #%d: %v", issueNumber, err)
-	}
 	} else {
 		log.Printf("Successfully created sub-task comment on issue #%d", issueNumber)
 	}
