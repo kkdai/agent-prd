@@ -96,34 +96,52 @@ func (b *Bot) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Successfully parsed webhook event of type: %T", event)
 
-	issueCommentEvent, ok := event.(*github.IssueCommentEvent)
-	if !ok || issueCommentEvent.GetAction() != "created" {
-		log.Printf("Ignoring event: not a new issue comment.")
-		return
+	switch event := event.(type) {
+	case *github.IssuesEvent:
+		if event.GetAction() == "opened" {
+			log.Printf("New issue opened #%d. Triggering PRD generation.", event.GetIssue().GetNumber())
+			client, err := createGitHubClient(event.GetInstallation().GetID())
+			if err != nil {
+				log.Printf("Error creating GitHub client for new issue: %v", err)
+				return // Don't write status OK, let GitHub retry
+			}
+			// Automatically trigger PRD generation for new issues.
+			go b.processIssuePRD(context.Background(), client, event.GetIssue(), event.GetRepo())
+		} else {
+			log.Printf("Ignoring issue event with action: %s", event.GetAction())
+		}
+
+	case *github.IssueCommentEvent:
+		if event.GetAction() != "created" {
+			log.Printf("Ignoring non-created issue comment event.")
+			return
+		}
+
+		command, mentioned := b.parseComment(event.GetComment().GetBody())
+		if !mentioned {
+			log.Printf("Bot was not mentioned correctly in comment.")
+			return
+		}
+
+		handler, exists := b.commands[command]
+		if !exists {
+			log.Printf("Bot was mentioned, but command '%s' is not recognized.", command)
+			return
+		}
+
+		log.Printf("Recognized command '%s' on issue #%d. Dispatching handler.", event.GetIssue().GetNumber(), command)
+		client, err := createGitHubClient(event.GetInstallation().GetID())
+		if err != nil {
+			log.Printf("Error creating GitHub client for comment: %v", err)
+			return
+		}
+
+		// Run the handler in a new goroutine to avoid blocking the webhook response.
+		go handler(context.Background(), client, event.GetIssue(), event.GetRepo())
+
+	default:
+		log.Printf("Ignoring event of type %T", event)
 	}
-
-	command, mentioned := b.parseComment(issueCommentEvent.GetComment().GetBody())
-	if !mentioned {
-		log.Printf("Bot was not mentioned correctly.")
-		return
-	}
-
-	handler, exists := b.commands[command]
-	if !exists {
-		log.Printf("Bot was mentioned, but command '%s' is not recognized.", command)
-		return
-	}
-
-	log.Printf("Recognized command '%s' on issue #%d. Dispatching handler.", command, issueCommentEvent.GetIssue().GetNumber())
-
-	client, err := createGitHubClient(issueCommentEvent.GetInstallation().GetID())
-	if err != nil {
-		log.Printf("Error creating GitHub client: %v", err)
-		return
-	}
-
-	// Run the handler in a new goroutine to avoid blocking the webhook response.
-	go handler(context.Background(), client, issueCommentEvent.GetIssue(), issueCommentEvent.GetRepo())
 
 	w.WriteHeader(http.StatusOK)
 }
